@@ -88,7 +88,7 @@ jobs:
           echo "--- Full authorizers.xml Node Identity line(s) ---"
           docker exec "${NODE1_CONTAINER}" grep "Node Identity" /opt/nifi/nifi-current/conf/authorizers.xml || true
           echo "--- Expected value (from .env) ---"
-          EXPECTED="$(grep NODE_IDENTITY .env | cut -d= -f2-)"
+          EXPECTED="$(grep NODE_IDENTITY .env | cut -d= -f2- | sed 's/^"//; s/"$//')"
           echo "[${EXPECTED}]"
           echo "--- Comparing ---"
           docker exec "${NODE1_CONTAINER}" \
