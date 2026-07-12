@@ -1,0 +1,197 @@
+# Deploy with: docker stack deploy -c docker-stack.yml nifi-cluster
+#
+# IMPORTANT: unlike `docker compose up`, `docker stack deploy` does NOT
+# automatically read a .env file sitting next to this one. You must
+# export the variables into your shell first:
+#   set -a; source .env; set +a
+#   docker stack deploy -c docker-stack.yml nifi-cluster
+# (see README.md - this is a genuine Swarm gotcha, not a mistake here)
+
+version: "3.8"
+
+services:
+  zookeeper:
+    image: bitnami/zookeeper:3.9
+    environment:
+      ALLOW_ANONYMOUS_LOGIN: "yes"
+    volumes:
+      - zk_data:/bitnami/zookeeper
+    networks:
+      - nifi_cluster_net
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+  nifi-node1:
+    image: apache/nifi:2.10.0
+    hostname: nifi-node1
+    networks:
+      - nifi_cluster_net
+    ports:
+      # mode: host means this port is bound directly on the swarm host,
+      # bypassing Swarm's routing mesh - essential here, since the
+      # routing mesh would otherwise randomly load-balance your browser
+      # to any of the 3 nodes rather than the specific one you asked for.
+      - target: 8443
+        published: 8443
+        protocol: tcp
+        mode: host
+    environment: &nifi_common_env
+      AUTH: tls
+      NIFI_CLUSTER_ADDRESS: nifi-node1
+      KEYSTORE_PATH: /opt/certs/node-shared.p12
+      KEYSTORE_TYPE: PKCS12
+      KEYSTORE_PASSWORD: ${KEYSTORE_PASSWORD}
+      KEY_PASSWORD: ${KEY_PASSWORD}
+      TRUSTSTORE_PATH: /opt/certs/truststore.jks
+      TRUSTSTORE_TYPE: JKS
+      TRUSTSTORE_PASSWORD: ${TRUSTSTORE_PASSWORD}
+      NIFI_SECURITY_USER_AUTHORIZER: managed-authorizer
+      # Every node presents the SAME shared certificate (see
+      # generate-cluster-certs.sh for why), so this one value covers all
+      # 3 nodes trusting each other for cluster protocol communication.
+      NODE_IDENTITY: ${NODE_IDENTITY}
+      INITIAL_ADMIN_IDENTITY: ${INITIAL_ADMIN_IDENTITY}
+      # Must be IDENTICAL across all 3 nodes - it decrypts the shared
+      # flow.xml.gz that gets synced across the cluster. A mismatch here
+      # breaks cluster flow sync, not just individual-node startup.
+      NIFI_SENSITIVE_PROPS_KEY: ${SENSITIVE_PROPS_KEY}
+
+      NIFI_WEB_HTTPS_HOST: 0.0.0.0
+      NIFI_WEB_HTTPS_PORT: "8443"
+      # All three externally-published ports plus all three internal
+      # service names - NiFi validates the browser's Host header against
+      # this list and rejects anything not on it.
+      NIFI_WEB_PROXY_HOST: "localhost:8443,localhost:8444,localhost:8445,nifi-node1:8443,nifi-node2:8443,nifi-node3:8443"
+
+      NIFI_CLUSTER_IS_NODE: "true"
+      NIFI_CLUSTER_NODE_PROTOCOL_PORT: "11443"
+      NIFI_ZK_CONNECT_STRING: "zookeeper:2181"
+      NIFI_ELECTION_MAX_WAIT: "1 min"
+      NIFI_ELECTION_MAX_CANDIDATES: "3"
+
+      # Heap sized down from the single-node project's 1g/2g, since
+      # you're now running 3 of these JVMs plus ZooKeeper concurrently
+      # on one machine. Raise if your ZBook has RAM to spare.
+      NIFI_JVM_HEAP_INIT: 768m
+      NIFI_JVM_HEAP_MAX: 1536m
+    volumes:
+      - ./certs:/opt/certs:ro
+      - nifi_node1_database:/opt/nifi/nifi-current/database_repository
+      - nifi_node1_flowfile:/opt/nifi/nifi-current/flowfile_repository
+      - nifi_node1_content:/opt/nifi/nifi-current/content_repository
+      - nifi_node1_provenance:/opt/nifi/nifi-current/provenance_repository
+      - nifi_node1_state:/opt/nifi/nifi-current/state
+      - nifi_node1_conf:/opt/nifi/nifi-current/conf
+      - nifi_node1_logs:/opt/nifi/nifi-current/logs
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 5
+        window: 120s
+      resources:
+        limits:
+          memory: 2g
+      # NOTE: Swarm's `deploy:` block does NOT support `ulimits` at all -
+      # that's a plain `docker compose` / `docker run` only feature. If
+      # you hit "Too many open files" under real load, the Swarm-native
+      # fix is setting default-ulimits in Docker's own daemon.json
+      # instead of per-service - see README.md.
+
+  nifi-node2:
+    image: apache/nifi:2.10.0
+    hostname: nifi-node2
+    networks:
+      - nifi_cluster_net
+    ports:
+      - target: 8443
+        published: 8444
+        protocol: tcp
+        mode: host
+    environment:
+      <<: *nifi_common_env
+      NIFI_CLUSTER_ADDRESS: nifi-node2
+    volumes:
+      - ./certs:/opt/certs:ro
+      - nifi_node2_database:/opt/nifi/nifi-current/database_repository
+      - nifi_node2_flowfile:/opt/nifi/nifi-current/flowfile_repository
+      - nifi_node2_content:/opt/nifi/nifi-current/content_repository
+      - nifi_node2_provenance:/opt/nifi/nifi-current/provenance_repository
+      - nifi_node2_state:/opt/nifi/nifi-current/state
+      - nifi_node2_conf:/opt/nifi/nifi-current/conf
+      - nifi_node2_logs:/opt/nifi/nifi-current/logs
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 5
+        window: 120s
+      resources:
+        limits:
+          memory: 2g
+
+  nifi-node3:
+    image: apache/nifi:2.10.0
+    hostname: nifi-node3
+    networks:
+      - nifi_cluster_net
+    ports:
+      - target: 8443
+        published: 8445
+        protocol: tcp
+        mode: host
+    environment:
+      <<: *nifi_common_env
+      NIFI_CLUSTER_ADDRESS: nifi-node3
+    volumes:
+      - ./certs:/opt/certs:ro
+      - nifi_node3_database:/opt/nifi/nifi-current/database_repository
+      - nifi_node3_flowfile:/opt/nifi/nifi-current/flowfile_repository
+      - nifi_node3_content:/opt/nifi/nifi-current/content_repository
+      - nifi_node3_provenance:/opt/nifi/nifi-current/provenance_repository
+      - nifi_node3_state:/opt/nifi/nifi-current/state
+      - nifi_node3_conf:/opt/nifi/nifi-current/conf
+      - nifi_node3_logs:/opt/nifi/nifi-current/logs
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 5
+        window: 120s
+      resources:
+        limits:
+          memory: 2g
+
+networks:
+  nifi_cluster_net:
+    driver: overlay
+    attachable: true
+
+volumes:
+  zk_data:
+  nifi_node1_database:
+  nifi_node1_flowfile:
+  nifi_node1_content:
+  nifi_node1_provenance:
+  nifi_node1_state:
+  nifi_node1_conf:
+  nifi_node1_logs:
+  nifi_node2_database:
+  nifi_node2_flowfile:
+  nifi_node2_content:
+  nifi_node2_provenance:
+  nifi_node2_state:
+  nifi_node2_conf:
+  nifi_node2_logs:
+  nifi_node3_database:
+  nifi_node3_flowfile:
+  nifi_node3_content:
+  nifi_node3_provenance:
+  nifi_node3_state:
+  nifi_node3_conf:
+  nifi_node3_logs:
