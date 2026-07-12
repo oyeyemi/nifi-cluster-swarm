@@ -50,15 +50,22 @@ jobs:
 
       - name: Wait for all 3 nodes to accept TLS connections
         run: |
+          # A plain TCP connect can succeed as soon as Docker's port
+          # forwarding is set up - before NiFi itself has finished
+          # booting inside the container. Checking for an actual TLS
+          # handshake response is a much stronger signal that NiFi's
+          # HTTPS listener specifically is up, not just that *something*
+          # is listening on the port.
           for port in 8443 8444 8445; do
             echo "Waiting on port ${port}..."
             connected=false
             for i in $(seq 1 40); do
-              if bash -c "</dev/tcp/localhost/${port}" 2>/dev/null; then
-                echo "Port ${port} is accepting connections"
+              if echo | openssl s_client -connect "localhost:${port}" 2>/dev/null | grep -q "CONNECTED"; then
+                echo "Port ${port} completed a TLS handshake"
                 connected=true
                 break
               fi
+              echo "  attempt ${i}/40: not ready yet"
               sleep 15
             done
             if [ "${connected}" != "true" ]; then
@@ -69,10 +76,24 @@ jobs:
 
       - name: Confirm the shared node identity seeded correctly
         run: |
+          echo "--- Containers matching nifi-cluster_nifi-node1 ---"
+          docker ps -a -f name=nifi-cluster_nifi-node1
           NODE1_CONTAINER=$(docker ps -q -f name=nifi-cluster_nifi-node1)
+          echo "Resolved container ID: [${NODE1_CONTAINER}]"
+          if [ -z "${NODE1_CONTAINER}" ]; then
+            echo "No running container found matching that name - it may still be starting, or the service failed to schedule."
+            docker service ps nifi-cluster_nifi-node1 --no-trunc || true
+            exit 1
+          fi
+          echo "--- Full authorizers.xml Node Identity line(s) ---"
+          docker exec "${NODE1_CONTAINER}" grep "Node Identity" /opt/nifi/nifi-current/conf/authorizers.xml || true
+          echo "--- Expected value (from .env) ---"
+          EXPECTED="$(grep NODE_IDENTITY .env | cut -d= -f2-)"
+          echo "[${EXPECTED}]"
+          echo "--- Comparing ---"
           docker exec "${NODE1_CONTAINER}" \
             grep -A1 "Node Identity 1" /opt/nifi/nifi-current/conf/authorizers.xml \
-            | grep -F "$(grep NODE_IDENTITY .env | cut -d= -f2-)"
+            | grep -F "${EXPECTED}"
 
       - name: Check for cluster coordinator election (informational)
         if: always()
@@ -143,11 +164,12 @@ jobs:
             echo "Waiting on port ${port}..."
             connected=false
             for i in $(seq 1 40); do
-              if bash -c "</dev/tcp/localhost/${port}" 2>/dev/null; then
-                echo "Port ${port} is accepting connections"
+              if echo | openssl s_client -connect "localhost:${port}" 2>/dev/null | grep -q "CONNECTED"; then
+                echo "Port ${port} completed a TLS handshake"
                 connected=true
                 break
               fi
+              echo "  attempt ${i}/40: not ready yet"
               sleep 15
             done
             if [ "${connected}" != "true" ]; then
