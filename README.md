@@ -189,3 +189,4 @@ available for this stack alone before starting it, on top of whatever
 else is running on your ZBook. Adjust `NIFI_JVM_HEAP_INIT` /
 `NIFI_JVM_HEAP_MAX` and each node's `deploy.resources.limits.memory` in
 `docker-stack.yml` if you need to scale that up or down.
+# trigger deploy
