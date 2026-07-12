@@ -1,0 +1,158 @@
+name: NiFi Swarm cluster - validate and deploy
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    # Runs on GitHub's own hosted runner - never touches your ZBook.
+    # Spins up a real single-node Swarm, deploys the full 3-node cluster
+    # + ZooKeeper inside it, confirms all 3 nodes come up and the admin
+    # identity seeded correctly, then tears the whole thing down.
+    #
+    # NOTE: this is heavier than the single-node project's validate job -
+    # 3 NiFi JVMs + ZooKeeper + cluster flow election all happening on a
+    # shared CI runner. Expect this to take several minutes, and give it
+    # generous wait windows rather than the tighter timeouts used for the
+    # single-node project.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shellcheck the cert script
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck
+          shellcheck scripts/generate-cluster-certs.sh
+
+      - name: Validate docker-stack.yml syntax
+        run: docker compose -f docker-stack.yml config >/dev/null
+
+      - name: Initialize a single-node Swarm
+        run: docker swarm init || true
+        # "|| true": GitHub's runners are sometimes already in a swarm
+        # from a prior job on the same runner image - safe to ignore.
+
+      - name: Generate throwaway certs
+        run: |
+          chmod +x scripts/generate-cluster-certs.sh
+          ./scripts/generate-cluster-certs.sh
+
+      - name: Deploy the stack
+        run: |
+          set -a
+          source .env
+          set +a
+          docker stack deploy -c docker-stack.yml nifi-cluster
+
+      - name: Wait for all 3 nodes to accept TLS connections
+        run: |
+          for port in 8443 8444 8445; do
+            echo "Waiting on port ${port}..."
+            connected=false
+            for i in $(seq 1 40); do
+              if bash -c "</dev/tcp/localhost/${port}" 2>/dev/null; then
+                echo "Port ${port} is accepting connections"
+                connected=true
+                break
+              fi
+              sleep 15
+            done
+            if [ "${connected}" != "true" ]; then
+              echo "Port ${port} never came up"
+              exit 1
+            fi
+          done
+
+      - name: Confirm the shared node identity seeded correctly
+        run: |
+          NODE1_CONTAINER=$(docker ps -q -f name=nifi-cluster_nifi-node1)
+          docker exec "${NODE1_CONTAINER}" \
+            grep -A1 "Node Identity 1" /opt/nifi/nifi-current/conf/authorizers.xml \
+            | grep -F "$(grep NODE_IDENTITY .env | cut -d= -f2-)"
+
+      - name: Check for cluster coordinator election (informational)
+        if: always()
+        run: |
+          echo "Checking node logs for cluster coordinator election..."
+          docker service logs nifi-cluster_nifi-node1 2>&1 | grep -i "cluster coordinator" || \
+            echo "No cluster coordinator line found yet - not necessarily a failure, cluster formation can take a few minutes"
+
+      - name: Dump service logs on failure
+        if: failure()
+        run: |
+          for svc in zookeeper nifi-node1 nifi-node2 nifi-node3; do
+            echo "===== ${svc} ====="
+            docker service logs "nifi-cluster_${svc}" 2>&1 | tail -50 || true
+          done
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker stack rm nifi-cluster || true
+          # Give Swarm time to actually remove networks before the
+          # runner's VM is discarded - avoids leaving orphaned state
+          # that could affect a subsequent run on a reused runner image.
+          sleep 10
+
+  deploy:
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # IMPORTANT: this needs its OWN self-hosted runner registered
+    # specifically to THIS repo - the runner you set up for the
+    # single-node project is registered to that other repo only, and
+    # won't pick up jobs here even though it's the same physical ZBook.
+    # See README.md's "CI/CD" section for the one-time setup.
+    runs-on: [self-hosted, zbook]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure this host is part of a Swarm
+        run: |
+          state=$(docker info --format '{{.Swarm.LocalNodeState}}')
+          if [ "${state}" != "active" ]; then
+            echo "Initializing Swarm on this host..."
+            docker swarm init
+          else
+            echo "Already part of a Swarm - leaving as-is."
+          fi
+
+      - name: Generate certs only if this is a first-time deploy
+        run: |
+          chmod +x scripts/generate-cluster-certs.sh
+          if [ ! -f .env ] || [ ! -d certs ]; then
+            echo "No existing certs/.env found - generating for the first time."
+            ./scripts/generate-cluster-certs.sh
+          else
+            echo "Existing certs/.env found - leaving them in place so the running cluster's identities stay valid."
+          fi
+
+      - name: Deploy the stack
+        run: |
+          set -a
+          source .env
+          set +a
+          docker stack deploy -c docker-stack.yml nifi-cluster
+
+      - name: Wait for all 3 nodes to accept TLS connections
+        run: |
+          for port in 8443 8444 8445; do
+            echo "Waiting on port ${port}..."
+            connected=false
+            for i in $(seq 1 40); do
+              if bash -c "</dev/tcp/localhost/${port}" 2>/dev/null; then
+                echo "Port ${port} is accepting connections"
+                connected=true
+                break
+              fi
+              sleep 15
+            done
+            if [ "${connected}" != "true" ]; then
+              echo "Port ${port} never came up"
+              docker service logs "nifi-cluster_nifi-node$((${port} - 8442))" || true
+              exit 1
+            fi
+          done

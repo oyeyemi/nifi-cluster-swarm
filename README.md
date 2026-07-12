@@ -124,6 +124,54 @@ container on the host, not just this stack):
 Then `sudo systemctl restart docker` (this restarts every running
 container on the host, not just this stack - plan accordingly).
 
+## CI/CD
+
+`.github/workflows/ci.yml` has the same two-job pattern as the
+single-node project, adapted for a 3-node cluster:
+
+**`validate`** runs on every push/PR, on GitHub's own hosted runner. It
+shellchecks the cert script, initializes a throwaway single-node Swarm
+inside the CI runner itself, deploys the full stack (ZooKeeper + all 3
+NiFi nodes), waits for all 3 published ports to come up, confirms the
+shared node identity seeded correctly, then tears everything down. This
+is slower than the single-node project's equivalent job - budget several
+minutes, since it's booting 3 JVMs plus ZooKeeper and waiting through a
+real cluster flow election, not just one node.
+
+**`deploy`** only runs on push to `main`, on a self-hosted runner.
+
+### This repo needs its OWN self-hosted runner - important
+
+If you already set up a self-hosted runner for the single-node NiFi
+project, **it will not pick up jobs for this repo**, even though it's
+the same physical ZBook. On a personal GitHub account, self-hosted
+runners are registered per-repository, not shared globally across all
+your repos. You need to repeat the runner setup once more, specifically
+for this repo:
+
+1. This repo on GitHub → **Settings → Actions → Runners → New self-hosted runner**
+2. Follow the commands it gives you, but install into a **different
+   folder** than your other runner (e.g. `~/actions-runner-cluster`
+   instead of `~/actions-runner`) - two runner installs can coexist on
+   the same machine, they just each need their own directory.
+3. Give it the label `zbook` again (matching `runs-on: [self-hosted, zbook]`
+   in this repo's `ci.yml` - the label name doesn't need to be globally
+   unique, only to match what each repo's own workflow expects).
+4. Install as a service so it survives reboots:
+   ```bash
+   sudo ./svc.sh install
+   sudo ./svc.sh start
+   ```
+
+### Resource contention if both projects run at once
+
+If the single-node NiFi project's container is *also* running on this
+same ZBook at the same time as this 3-node cluster, you're now running
+4+ NiFi JVMs plus ZooKeeper concurrently on one machine. Check your
+available RAM before deploying both - stop the single-node project
+first (`docker compose down`, in that project's folder) if you hit
+memory pressure.
+
 ## Tearing down
 
 ```bash
